@@ -239,3 +239,80 @@ print(output.shape)
 
 plt.imshow(output.squeeze(0).permute(1,2,0))
 plt.show()
+
+
+
+
+# ---- Redes convolucionales ----
+
+# generamos la red convolucional definiendo las capas
+def block(c_in, c_out, k=3, p=1, s=1, pk=2, ps=2):
+    return torch.nn.Sequential(
+        torch.nn.Conv2d(c_in, c_out, k, padding=p, stride=s),
+        torch.nn.ReLU(),
+        torch.nn.MaxPool2d(pk, stride=ps)
+    )
+
+# función para aplicar la red convolucional 
+class CNN(torch.nn.Module):
+  def __init__(self, n_channels=1, n_outputs=10):
+    super().__init__()
+    self.conv1 = block(n_channels, 64)
+    self.conv2 = block(64, 128)
+    self.fc = torch.nn.Linear(128*7*7, n_outputs)
+
+# flujo de datos entre capas
+  def forward(self, x):
+    print("Dimensiones:")
+    print("Entrada: ", x.shape)
+    x = self.conv1(x)
+    print("conv1: ", x.shape)
+    x = self.conv2(x)
+    print("conv2: ", x.shape)
+    x = x.view(x.shape[0], -1)
+    print("pre fc: ", x.shape)
+    x = self.fc(x)
+    print("Salida: ", x.shape)
+    return x
+
+model = CNN()
+
+# batch de 64 imágenes aleatorias de 28x28
+output = model(torch.randn(64, 1, 28, 28))
+
+
+
+
+class CNN(torch.nn.Module):
+  def __init__(self, n_channels=1, n_outputs=10):
+    super().__init__()
+    self.conv1 = block(n_channels, 64)
+    self.conv2 = block(64, 128)
+    self.fc = torch.nn.Linear(128*7*7, n_outputs)
+
+  def forward(self, x):
+    x = self.conv1(x)
+    x = self.conv2(x)
+    x = x.view(x.shape[0], -1)
+    x = self.fc(x)
+    return x
+  
+
+# usamos el dataset mnist
+class Dataset(torch.utils.data.Dataset):
+	def __init__(self, X, Y):
+		self.X = torch.tensor(X).float()
+		self.Y = torch.tensor(Y).long()
+
+	def __len__(self):
+		return len(self.X)
+
+	# devolvemos las imágenes con dimensiones (C, H, W)
+	def __getitem__(self, ix):
+		return self.X[ix].reshape(1, 28, 28), self.Y[ix]
+	
+
+model = CNN()
+
+train(model)
+
