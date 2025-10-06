@@ -12,6 +12,7 @@ import numpy as np
 import scipy.signal
 from skimage import color
 from skimage import exposure
+import math
 
 # descargamos el dataset mnist
 mnist = fetch_openml('mnist_784', version=1)
@@ -394,3 +395,212 @@ print(output.shape)
 # existen múltiples variantes: resnet18, resnet35, resnet50, resnet101, resnet152
 resnet34 = torchvision.models.resnet34()
 print(resnet34)
+
+
+
+# ---- Transformers ----
+
+# descargamos el dataset mnist
+mnist = fetch_openml('mnist_784', version=1)
+X, Y = mnist["data"].values.astype(np.float32), mnist["target"].values.astype(int)
+
+# creamos un dataset que recibe las imaǵenes y etiquetas
+class Dataset(torch.utils.data.Dataset):
+  def __init__(self, X, y, patch_size=(7, 7)):
+    self.X = X
+    self.y = y
+    self.patch_size = patch_size
+
+  def __len__(self):
+    return len(self.X)
+
+# creamos patches
+  def __getitem__(self, ix):
+    image = torch.from_numpy(self.X[ix]).float().view(28, 28) # 28 x 28
+    h, w = self.patch_size
+    patches = image.unfold(0, h, h).unfold(1, w, w) # 4 x 4 x 7 x 7
+    patches = patches.contiguous().view(-1, h*w) # 16 x 49
+    return patches, torch.tensor(self.y[ix]).long()
+  
+
+
+
+attn_dm = Dataset(X, Y)
+imgs, labels = attn_dm[0]
+print(imgs.shape, labels.shape)
+
+# ejemplo de visualización
+fig = plt.figure(figsize=(5,5))
+for i in range(4):
+    for j in range(4):
+        ax = plt.subplot(4, 4, i*4 + j + 1)
+        ax.imshow(imgs[i*4 + j].view(7, 7), cmap="gray")
+        ax.axis('off')
+plt.show()
+
+# ejemplo de self attention
+class ScaledDotSelfAttention(torch.nn.Module):
+
+    def __init__(self, n_embd):
+        super().__init__()
+
+        # key, query, value projections
+        self.key = torch.nn.Linear(n_embd, n_embd)
+        self.query = torch.nn.Linear(n_embd, n_embd)
+        self.value = torch.nn.Linear(n_embd, n_embd)
+
+    def forward(self, x):
+        B, L, F = x.size()
+
+        # calculate query, key, values
+        k = self.key(x) # (B, L, F)
+        q = self.query(x) # (B, L, F)
+        v = self.value(x) # (B, L, F)
+
+        # attention (B, L, F) x (B, F, L) -> (B, L, L)
+        att = (q @ k.transpose(1, 2)) * (1.0 / math.sqrt(k.size(-1)))
+        att = torch.nn.functional.softmax(att, dim=-1)
+        y = att @ v # (B, L, L) x (B, L, F) -> (B, L, F)
+
+        return y
+
+class Model(torch.nn.Module):
+
+    def __init__(self, n_embd=7*7, seq_len=4*4):
+        super().__init__()
+        self.attn = ScaledDotSelfAttention(n_embd)
+        self.actn = torch.nn.ReLU(inplace=True)
+        self.fc = torch.nn.Linear(n_embd*seq_len, 10)
+
+    def forward(self, x):
+        x = self.attn(x)
+        y = self.fc(self.actn(x.view(x.size(0), -1)))
+        return y
+    
+
+
+model = Model()
+
+train(model)
+
+
+# ejemplo de multi head attention
+class MultiHeadAttention(torch.nn.Module):
+    def __init__(self, n_embd, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+        # key, query, value projections
+        self.key = torch.nn.Linear(n_embd, n_embd*n_heads)
+        self.query = torch.nn.Linear(n_embd, n_embd*n_heads)
+        self.value = torch.nn.Linear(n_embd, n_embd*n_heads)
+
+        # output projection
+        self.proj = torch.nn.Linear(n_embd*n_heads, n_embd)
+
+    def forward(self, x):
+        B, L, F = x.size()
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        k = self.key(x).view(B, L, F, self.n_heads).transpose(1, 3) # (B, nh, L, F)
+        q = self.query(x).view(B, L, F, self.n_heads).transpose(1, 3) # (B, nh, L, F)
+        v = self.value(x).view(B, L, F, self.n_heads).transpose(1, 3) # (B, nh, L, F)
+
+        # attention (B, nh, L, F) x (B, nh, F, L) -> (B, nh, L, L)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = torch.nn.functional.softmax(att, dim=-1)
+        y = att @ v # (B, nh, L, L) x (B, nh, L, F) -> (B, nh, L, F)
+        y = y.transpose(1, 2).contiguous().view(B, L, F*self.n_heads) # re-assemble all head outputs side by side
+
+        return self.proj(y)
+
+class Model(torch.nn.Module):
+
+    def __init__(self, n_embd=7*7, seq_len=4*4, n_heads=4*4):
+        super().__init__()
+        self.attn = MultiHeadAttention(n_embd, n_heads)
+        self.actn = torch.nn.ReLU(inplace=True)
+        self.fc = torch.nn.Linear(n_embd*seq_len, 10)
+
+    def forward(self, x):
+        x = self.attn(x)
+        y = self.fc(self.actn(x.view(x.size(0), -1)))
+        return y
+
+model = Model()
+
+train(model)
+
+
+# ejemplo de encoder
+class MultiHeadAttention(torch.nn.Module):
+
+    def __init__(self, n_embd, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+        # key, query, value projections
+        self.key = torch.nn.Linear(n_embd, n_embd*n_heads)
+        self.query = torch.nn.Linear(n_embd, n_embd*n_heads)
+        self.value = torch.nn.Linear(n_embd, n_embd*n_heads)
+
+        # output projection
+        self.proj = torch.nn.Linear(n_embd*n_heads, n_embd)
+
+    def forward(self, x):
+        B, L, F = x.size()
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        k = self.key(x).view(B, L, F, self.n_heads).transpose(1, 3) # (B, nh, L, F)
+        q = self.query(x).view(B, L, F, self.n_heads).transpose(1, 3) # (B, nh, L, F)
+        v = self.value(x).view(B, L, F, self.n_heads).transpose(1, 3) # (B, nh, L, F)
+
+        # attention (B, nh, L, F) x (B, nh, F, L) -> (B, nh, L, L)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = torch.nn.functional.softmax(att, dim=-1)
+        y = att @ v # (B, nh, L, L) x (B, nh, L, F) -> (B, nh, L, F)
+        y = y.transpose(1, 2).contiguous().view(B, L, F*self.n_heads) # re-assemble all head outputs side by side
+
+        return self.proj(y)
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(self, n_embd, n_heads):
+        super().__init__()
+        self.ln1 = torch.nn.LayerNorm(n_embd)
+        self.ln2 = torch.nn.LayerNorm(n_embd)
+        self.attn = MultiHeadAttention(n_embd, n_heads)
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(n_embd, 4 * n_embd),
+            torch.nn.ReLU(),
+            torch.nn.Linear(4 * n_embd, n_embd),
+        )
+
+    def forward(self, x):
+        x = self.ln1(x + self.attn(x))
+        x = self.ln2(x + self.mlp(x))
+        return x
+
+class Model(torch.nn.Module):
+
+    def __init__(self, n_input=7*7, n_embd=7*7, seq_len=4*4, n_heads=4*4, n_layers=1):
+        super().__init__()
+        self.pos_emb = torch.nn.Parameter(torch.zeros(1, seq_len, n_embd))
+        self.inp_emb = torch.nn.Linear(n_input, n_embd)
+        self.tranformer = torch.nn.Sequential(*[TransformerBlock(n_embd, n_heads) for _ in range(n_layers)])
+        self.fc = torch.nn.Linear(n_embd*seq_len, 10)
+
+    def forward(self, x):
+        # embedding
+        e = self.inp_emb(x) + self.pos_emb
+        # transformer blocks
+        x = self.tranformer(e)
+        # classifier
+        y = self.fc(x.view(x.size(0), -1))
+        return y
+    
+
+
+model = Model()
+
+train(model)
+
