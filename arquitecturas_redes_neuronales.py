@@ -13,6 +13,7 @@ import scipy.signal
 from skimage import color
 from skimage import exposure
 import math
+import torch.nn as nn
 
 # descargamos el dataset mnist
 mnist = fetch_openml('mnist_784', version=1)
@@ -604,3 +605,231 @@ model = Model()
 
 train(model)
 
+
+# ---- Transformers II -----
+
+# descargamos el dataset mnist
+mnist = fetch_openml('mnist_784', version=1)
+X, Y = mnist["data"].values.astype(np.float32), mnist["target"].values.astype(int)
+
+# variable de las letras
+vocab = 'abcdefghijklmnopqrstuvwxyz'
+len_vocab = len(vocab) + 3
+
+# función para mostrar la letra
+def number2caption(ix):
+    if ix == 0: return 'cero'
+    if ix == 1: return 'uno'
+    if ix == 2: return 'dos'
+    if ix == 3: return 'tres'
+    if ix == 4: return 'cuatro'
+    if ix == 5: return 'cinco'
+    if ix == 6: return 'seis'
+    if ix == 7: return 'siete'
+    if ix == 8: return 'ocho'
+    if ix == 9: return 'nueve'
+
+def caption2ixs(caption):
+    return [vocab.index(c) + 3 for c in caption]
+
+def ixs2caption(ixs):
+    return ('').join([vocab[ix - 3] for ix in ixs if ix not in [0, 1, 2]])
+
+
+
+
+captions = [number2caption(ix) for ix in Y]
+
+# cada letra tiene su número (índice en el vocab)
+encoded = [[1] + caption2ixs(caption) + [2] for caption in captions] 
+
+print(captions[:3], encoded[:3])
+
+# ejemplo de lo que se quiere conseguir
+r, c = 4, 4
+fig = plt.figure(figsize=(c*2, r*2))
+for _r in range(r):
+    for _c in range(c):
+        ix = _r*c + _c
+        ax = plt.subplot(r, c, ix + 1)
+        img, caption = X[ix], captions[ix]
+        ax.axis("off")
+        ax.imshow(img.reshape(28,28), cmap="gray")
+        ax.set_title(caption)
+plt.show()
+
+
+# creamos un dataset con las imágenes
+class Dataset(torch.utils.data.Dataset):
+  def __init__(self, X, y, patch_size=(7, 7)):
+    self.X = X
+    self.y = y
+
+  def __len__(self):
+    return len(self.X)
+
+  def __getitem__(self, ix):
+    image = torch.from_numpy(self.X[ix]).float().view(1, 28, 28) 
+    return image, torch.tensor(self.y[ix]).long()
+  
+# lógica de los patches con una capa convolucional
+class PatchEmbedding(nn.Module):
+    def __init__(self, img_size, patch_size, in_chans, embed_dim):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        self.patch_size = patch_size
+        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+
+    def forward(self, x):
+        x = self.proj(x)  # (B, E, P, P)
+        x = x.flatten(2)  # (B, E, N)
+        x = x.transpose(1, 2)  # (B, N, E)
+        return x
+
+# creamos el modelo
+class Model(torch.nn.Module):
+
+    def __init__(self,
+                 len_vocab,
+                 img_size=28,
+                 patch_size=7,
+                 in_chans=1,
+                 embed_dim=100,
+                 max_len=8,
+                 nhead=2,
+                 num_encoder_layers=3,
+                 num_decoder_layers=3,
+                 dim_feedforward=400,
+                 dropout=0.1
+                ):
+        super().__init__()
+
+        self.patch_embed = PatchEmbedding(img_size, patch_size, in_chans, embed_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.n_patches, embed_dim))
+
+        self.trg_emb = nn.Embedding(len_vocab, embed_dim)
+        self.trg_pos_emb = nn.Embedding(max_len, embed_dim)
+        self.max_len = max_len
+
+        self.transformer = torch.nn.Transformer(
+            embed_dim, nhead, num_encoder_layers, num_decoder_layers, dim_feedforward, dropout
+        )
+
+        self.l = nn.LayerNorm(embed_dim)
+        self.fc = nn.Linear(embed_dim, len_vocab)
+
+    def forward(self, images, captions):
+        # embed images
+        embed_imgs = self.patch_embed(images)
+        embed_imgs = embed_imgs + self.pos_embed  # (B, N, E)
+        # embed captions
+        B, trg_seq_len = captions.shape
+        trg_positions = (torch.arange(0, trg_seq_len).expand(B, trg_seq_len).to(images.device))
+        embed_trg = self.trg_emb(captions) + self.trg_pos_emb(trg_positions)
+        trg_mask = self.transformer.generate_square_subsequent_mask(trg_seq_len).to(images.device)
+        tgt_padding_mask = captions == 0
+        # transformer
+        y = self.transformer(
+            embed_imgs.permute(1,0,2),  # S, B, E
+            embed_trg.permute(1,0,2),  # T, B, E
+            tgt_mask=trg_mask, # T, T
+            tgt_key_padding_mask = tgt_padding_mask
+        ).permute(1,0,2) # B, T, E
+        # head
+        return self.fc(self.l(y))
+
+# evaluación del modelo
+    def predict(self, image, device):
+        self.eval()
+        self.to(device)
+        with torch.no_grad():
+            image = image.to(device)
+            B = 1
+            # start of sentence
+            eos = torch.tensor([1], dtype=torch.long, device=device).expand(B, 1)
+            trg_input = eos
+            for _ in range(self.max_len):
+                preds = self(image.unsqueeze(0), trg_input)
+                preds = torch.argmax(preds, axis=2)
+                trg_input = torch.cat([eos, preds], 1)
+            return preds
+
+
+
+
+MAX_LEN = 8
+
+# función del batch
+def collate_fn(batch):
+    images, captions = zip(*batch)
+    images = torch.stack(images)
+    captions = [torch.nn.functional.pad(caption, (0, MAX_LEN - len(caption)), value=0) for caption in captions]
+    captions = torch.stack(captions)
+    return images, captions
+
+
+# entrenamos el modelo
+def train(model, epochs=5, batch_size=1000):
+	dataset = {
+		"train": Dataset(X[:60000], encoded[:60000]), # 60.000 imágenes para entrenamiento
+		"val": Dataset(X[60000:], encoded[60000:])    # 10.000 imágenes para validación
+	}
+	dataloader = {
+		'train': torch.utils.data.DataLoader(dataset['train'], batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, collate_fn=collate_fn),
+		'val': torch.utils.data.DataLoader(dataset['val'], batch_size=batch_size, num_workers=4, pin_memory=True, collate_fn=collate_fn)
+	}
+	model.cuda()
+	criterion = torch.nn.CrossEntropyLoss()
+	optimizer = torch.optim.Adam(model.parameters())
+	for e in range(1, epochs+1):
+		print(f"epoch: {e}/{epochs}")
+		# entrenamiento
+		model.train()
+		for batch_ix, (x, y) in enumerate(dataloader['train']):
+			x, y = x.cuda(), y.cuda()
+			optimizer.zero_grad()
+			outputs = model(x, y[:,:-1])
+			loss = criterion(outputs.permute(0,2,1), y[:,1:])
+			loss.backward()
+			optimizer.step()
+			if batch_ix % 10 == 0:
+				loss, current = loss.item(), (batch_ix + 1) * len(x)
+				print(f"loss: {loss:.4f} [{current:>5d}/{len(dataset['train']):>5d}]")
+		# validación
+		model.eval()
+		val_loss, val_acc = [], []
+		with torch.no_grad():
+			for batch_ix, (x, y) in enumerate(dataloader['val']):
+				x, y = x.cuda(), y.cuda()
+				outputs = model(x, y[:,:-1])
+				loss = criterion(outputs.permute(0,2,1), y[:,1:])
+				val_loss.append(loss.item())
+				acc = (torch.argmax(outputs, axis=2) == y[:,1:]).sum().item() / (y[:,1:].shape[0]*y[:,1:].shape[1])
+				val_acc.append(acc)
+		print(f"val_loss: {np.mean(val_loss):.4f} val_acc: {np.mean(val_acc):.4f}")
+
+
+
+
+model = Model(len(vocab) + 3, max_len=MAX_LEN)
+
+train(model)
+
+
+# visualización de los resultados
+r, c = 5,5
+fig = plt.figure(figsize=(c*2, r*2))
+for _r in range(r):
+    for _c in range(c):
+        # ix = _r*c + _c
+        ix = random.randint(0, len(X))
+        ax = plt.subplot(r, c, _r*c + _c + 1)
+        img, caption = torch.from_numpy(X[ix]).float().view(1, 28, 28), captions[ix]
+        ax.axis("off")
+        ax.imshow(img.reshape(28,28), cmap="gray")
+        pred = model.predict(img, device='cuda')
+        pred = ixs2caption(pred.squeeze().tolist())
+        ax.set_title(f'{caption}/{pred}', color="green" if caption == pred else 'red')
+plt.show()
